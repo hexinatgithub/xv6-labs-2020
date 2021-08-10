@@ -152,6 +152,22 @@ freeproc(struct proc *p)
   p->state = UNUSED;
 }
 
+int
+nproc(void)
+{
+  struct proc *p;
+  int count = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+      count++;
+    } 
+    release(&p->lock);
+  }
+  return count;
+}
+
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
 pagetable_t
@@ -282,6 +298,9 @@ fork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+
+  // copy trace mask in child.
+  np->tracemask = p->tracemask;
 
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
