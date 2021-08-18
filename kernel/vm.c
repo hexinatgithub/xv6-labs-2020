@@ -440,3 +440,38 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
+
+void
+vmprint(pagetable_t pgtbl) 
+{
+  pde_t pde;
+  pagetable_t pgtbls[3] = {pgtbl};
+  int pei[3] = {0, 0, 0}, level = 0, i;
+
+  printf("page table %p\n", pgtbl);
+  while(level >= 0)
+  {
+    // print current level page table continue at previous left i index pte
+    while((i = pei[level]) < 512)
+    {
+      pde = (pde_t)pgtbls[level][i];
+      pei[level]++;
+      if(PTE_FLAGS(pde) & PTE_V)
+      {
+        printf("..");
+        for(int l = level; l > 0; l--)
+          printf(" ..");
+        printf("%d: pte %p pa %p\n", i, pgtbls[level][i], PTE2PA(pde));
+
+        // not leaf, print next level page table
+        if(level < 2)
+        {
+          level++;
+          pgtbls[level] = (pagetable_t)PTE2PA(pde);
+          pei[level] = 0;
+        }
+      }
+    }
+    level--;
+  }
+}
