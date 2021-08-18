@@ -15,6 +15,77 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+// Recursively free page-table pages, but not free leaf physical memory pages.
+static void
+freewalkpgtbl(pagetable_t pagetable, int level)
+{
+  if(level == 2)
+    goto freepgtbl;
+
+  pde_t pde;
+  for(int i = 0; i < 512; i++)
+  {
+    pde = pagetable[i];
+    pagetable[i] = 0;
+    if(pde & PTE_V)
+      freewalkpgtbl((pagetable_t) PTE2PA(pde), level+1);
+  }
+freepgtbl:
+  kfree(pagetable);
+}
+
+/*
+ * copy kernel page table to user process
+ */
+static pagetable_t 
+pagetablecopy(pagetable_t srcpd, int level)
+{
+  uint64 pa;
+  pde_t pde;
+  pagetable_t pgtbl = (pagetable_t) kalloc();
+
+  if(pgtbl == 0)
+    return 0;
+  else if(level == 2)
+  {
+    memmove(pgtbl, srcpd, PGSIZE);
+    return pgtbl;
+  }
+  memset(pgtbl, 0, PGSIZE);
+
+  for(int i = 0; i < 512; i++)
+  {
+    pde = (pde_t)srcpd[i];
+    if(pde & PTE_V)
+    {
+      pa = (uint64) pagetablecopy((pagetable_t) PTE2PA(pde), level+1);
+      if(pa == 0)
+      {
+        freewalkpgtbl(pgtbl, level);
+        return 0;
+      }
+      pgtbl[i] = PA2PTE(pa) | PTE_V;
+    }
+  }
+  return pgtbl;
+}
+
+/*
+ * create a copy of global kernel page table
+ */
+pagetable_t
+kvmcopy()
+{
+  return pagetablecopy(kernel_pagetable, 0);
+}
+
+inline void
+kvmset(pagetable_t pgtbl)
+{
+  w_satp(MAKE_SATP(pgtbl));
+  sfence_vma();
+}
+
 /*
  * create a direct-map page table for the kernel.
  */
@@ -52,8 +123,7 @@ kvminit()
 void
 kvminithart()
 {
-  w_satp(MAKE_SATP(kernel_pagetable));
-  sfence_vma();
+  kvmset(kernel_pagetable);
 }
 
 // Return the address of the PTE in page table pagetable
@@ -297,6 +367,13 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
   freewalk(pagetable);
+}
+
+// Free user memory pages, but not leaf physical memory pages
+void
+uvmfreekernelpgtbl(pagetable_t pagetable)
+{
+  freewalkpgtbl(pagetable, 0);
 }
 
 // Given a parent process's page table, copy
