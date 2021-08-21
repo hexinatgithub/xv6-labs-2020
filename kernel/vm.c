@@ -17,9 +17,9 @@ extern char trampoline[]; // trampoline.S
 
 // Recursively free page-table pages, but not free leaf physical memory pages.
 static void
-freewalkpgtbl(pagetable_t pagetable, int level)
+freepagetable(pagetable_t pagetable, int level)
 {
-  if(level == 2)
+  if(level == 0)
     goto freepgtbl;
 
   pde_t pde;
@@ -28,14 +28,14 @@ freewalkpgtbl(pagetable_t pagetable, int level)
     pde = pagetable[i];
     pagetable[i] = 0;
     if(pde & PTE_V)
-      freewalkpgtbl((pagetable_t) PTE2PA(pde), level+1);
+      freepagetable((pagetable_t) PTE2PA(pde), level-1);
   }
 freepgtbl:
-  kfree(pagetable);
+  kfree((void *) pagetable);
 }
 
 /*
- * copy kernel page table to user process
+ * copy whole pagetable at level, physical memory will not be copyed.
  */
 static pagetable_t 
 pagetablecopy(pagetable_t srcpd, int level)
@@ -46,7 +46,7 @@ pagetablecopy(pagetable_t srcpd, int level)
 
   if(pgtbl == 0)
     return 0;
-  else if(level == 2)
+  else if(level == 0)
   {
     memmove(pgtbl, srcpd, PGSIZE);
     return pgtbl;
@@ -58,10 +58,10 @@ pagetablecopy(pagetable_t srcpd, int level)
     pde = (pde_t)srcpd[i];
     if(pde & PTE_V)
     {
-      pa = (uint64) pagetablecopy((pagetable_t) PTE2PA(pde), level+1);
+      pa = (uint64) pagetablecopy((pagetable_t) PTE2PA(pde), level-1);
       if(pa == 0)
       {
-        freewalkpgtbl(pgtbl, level);
+        freepagetable(pgtbl, level);
         return 0;
       }
       pgtbl[i] = PA2PTE(pa) | PTE_V;
@@ -71,12 +71,15 @@ pagetablecopy(pagetable_t srcpd, int level)
 }
 
 /*
- * create a copy of global kernel page table
+ * Create a copy virtual address map of global kernel page table, only used for user process's kernerl page table.
+ * below PLIC address are not copy.
  */
 pagetable_t
 kvmcopy()
 {
-  return pagetablecopy(kernel_pagetable, 0);
+  pagetable_t pagetable = pagetablecopy(kernel_pagetable, 2);
+  uvmunmap(pagetable, CLINT, 0x10000/PGSIZE, 0);
+  return pagetable;
 }
 
 inline void
@@ -339,6 +342,24 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+// unmap process's kernel pagetable from oldsz to newsz.
+uint64
+ukvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+  if(newsz >= oldsz)
+    return oldsz;
+
+  pde_t *pde;
+  newsz = PGROUNDUP(newsz);
+  for(int i = newsz; i < oldsz; i += PGSIZE){
+    if((pde = walk(pagetable, i, 0)) != 0){
+      *pde = 0;
+    }
+  }
+
+  return newsz;
+}
+
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
@@ -371,9 +392,9 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Free user memory pages, but not leaf physical memory pages
 void
-uvmfreekernelpgtbl(pagetable_t pagetable)
+ukvmfree(pagetable_t pagetable)
 {
-  freewalkpgtbl(pagetable, 0);
+  freepagetable(pagetable, 2);
 }
 
 // Given a parent process's page table, copy
@@ -410,6 +431,41 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
  err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+// Copy whole virtual address map from src process's user pagetable to dst process's kernel pagetable,
+// return 0 if succeed otherwise return -1.
+inline int
+ukvmcopymap(pagetable_t dst, pagetable_t src, int sz)
+{
+  return ukvmcopyrangemap(dst, src, 0, sz);
+}
+
+
+// Copy virtual address map from src process's user pagetable to dst process's kernel pagetable,
+// memory reference from process oldsz to newsz will be coped.
+// oldsz and newsz may not need aligned.
+// return -1 if succeed otherwise return 0;
+int
+ukvmcopyrangemap(pagetable_t dst, pagetable_t src, uint64 oldsz, uint64 newsz)
+{
+  pde_t *pde;
+  oldsz = PGROUNDUP(oldsz);
+
+  for(int i = oldsz; i < newsz; i += PGSIZE)
+  {
+    pde = walk(src, i, 0);
+    if(pde == 0 || (*pde & PTE_V) == 0)
+    {
+      // src page table may contain some guard page
+      continue;
+    }
+    if(mappages(dst, i, PGSIZE, PTE2PA(*pde), PTE_FLAGS(*pde) & ~PTE_U) < 0)
+    {
+      return -1;
+    }
+  }
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -456,23 +512,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -482,73 +522,56 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 void
 vmprint(pagetable_t pgtbl) 
 {
   pde_t pde;
-  pagetable_t pgtbls[3] = {pgtbl};
-  int pei[3] = {0, 0, 0}, level = 0, i;
+  pagetable_t pgtbls[3] = {0, 0, pgtbl};
+  int pei[3] = {0, 0, 0}, level = 2, i;
 
   printf("page table %p\n", pgtbl);
-  while(level >= 0)
+  while(level <= 2)
   {
     // print current level page table continue at previous left i index pte
     while((i = pei[level]) < 512)
     {
       pde = (pde_t)pgtbls[level][i];
       pei[level]++;
-      if(PTE_FLAGS(pde) & PTE_V)
+      if(pde & PTE_V)
       {
         printf("..");
-        for(int l = level; l > 0; l--)
+        for(int l = level; l < 2; l++)
           printf(" ..");
         printf("%d: pte %p pa %p\n", i, pgtbls[level][i], PTE2PA(pde));
 
         // not leaf, print next level page table
-        if(level < 2)
+        if(level > 0)
         {
-          level++;
+          level--;
           pgtbls[level] = (pagetable_t)PTE2PA(pde);
           pei[level] = 0;
         }
       }
     }
-    level--;
+    level++;
   }
 }
+
+// only used for debug pagetable and kernel pagetable different
+// uncomment defs.h
+// void 
+// printva2pa(pagetable_t pagetable)
+// {
+//   pde_t *pde;
+//   for(int va = 0; va < PLIC; va+=PGSIZE)
+//   {
+//     pde = walk(pagetable, va, 0);
+//     if(pde != 0 && *pde & PTE_V)
+//     {
+//       printf("pte %p: (va %p ----- pa %p), flags: %p\n", *pde, va, PTE2PA(*pde), PTE_FLAGS(*pde));
+//     }
+//   }
+// }

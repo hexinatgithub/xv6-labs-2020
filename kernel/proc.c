@@ -30,7 +30,17 @@ procinit(void)
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
+      // Allocate a page for the process's kernel stack.
+      // Map it high in memory, followed by an invalid
+      // guard page.
+      char *pa = kalloc();
+      if(pa == 0)
+        panic("kalloc");
+      uint64 va = KSTACK((int) (p - proc));
+      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+      p->kstack = va;
   }
+  kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -81,9 +91,7 @@ allocpid() {
 static struct proc*
 allocproc(void)
 {
-  char *pa;
   struct proc *p;
-  uint64 va;
 
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
@@ -112,20 +120,7 @@ found:
     return 0;
   }
 
-  // Allocate a page for the process's kernel stack.
-  // Map it high in memory, followed by an invalid
-  // guard page.
-  pa = kalloc();
-  if(pa == 0){
-    freeproc(p);
-    release(&p->lock);
-    return 0;
-  }
-  va = KSTACK((int) (p - proc));
-  kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-  p->kstack = va;
-
-  // Copy from kernel page table.
+  // Create process kernel page table from global kernel page table.
   p->kpagetable= kvmcopy();
   if(p->kpagetable == 0){
     freeproc(p);
@@ -154,8 +149,9 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   if(p->kpagetable)
-    proc_freekernelpagetable(p->kpagetable);
+    proc_free_kernelpagetable(p->kpagetable);
   p->pagetable = 0;
+  p->kpagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -209,10 +205,10 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
-void
-proc_freekernelpagetable(pagetable_t pagetable)
+inline void
+proc_free_kernelpagetable(pagetable_t pagetable)
 {
-  uvmfreekernelpgtbl(pagetable);
+  ukvmfree(pagetable);
 }
 
 // a user program that calls exec("/init")
@@ -240,6 +236,8 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  if(ukvmcopymap(p->kpagetable, p->pagetable, p->sz) < 0)
+    panic("userinit");
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -258,18 +256,25 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint newsz, oldsz;
   struct proc *p = myproc();
 
-  sz = p->sz;
-  if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+  oldsz = p->sz;
+  newsz = oldsz;
+  if(oldsz + n > PLIC)
+    return -1;
+  else if(n > 0){
+    if((newsz = uvmalloc(p->pagetable, oldsz, oldsz + n)) == 0) {
       return -1;
     }
+    if(ukvmcopyrangemap(p->kpagetable, p->pagetable, oldsz, oldsz + n) < 0)
+      return -1;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    newsz = uvmdealloc(p->pagetable, oldsz, oldsz + n);
+    if(ukvmdealloc(p->kpagetable, oldsz, oldsz + n) < 0)
+      return -1;
   }
-  p->sz = sz;
+  p->sz = newsz;
   return 0;
 }
 
@@ -294,6 +299,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if(ukvmcopymap(np->kpagetable, np->pagetable, np->sz) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   np->parent = p;
 

@@ -51,6 +51,8 @@ exec(char *path, char **argv)
     uint64 sz1;
     if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
+    if(sz1 > PLIC)
+      goto bad;
     sz = sz1;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
@@ -95,6 +97,11 @@ exec(char *path, char **argv)
   if(sp < stackbase)
     goto bad;
   if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+    goto bad;
+  
+  // create process kernel page table
+  ukvmdealloc(p->kpagetable, oldsz, 0);
+  if(ukvmcopymap(p->kpagetable, pagetable, sz)<0)
     goto bad;
 
   // arguments to user main(argc, argv)
