@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -482,5 +483,155 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  int length, prot, flags, fd, offset;
+  struct proc *p = myproc();
+  struct vma *pre = 0, *vma = p->vma;
+
+  if(argaddr(0, &addr) < 0 || addr % PGSIZE != 0)
+    return -1;
+  if(argint(1, &length) < 0 || length <= 0)
+    return -1;
+  if(argint(2, &prot) < 0)
+    return -1;
+  if(argint(3, &flags) < 0)
+    return -1;
+  if(argint(4, &fd) < 0)
+    return -1;
+  if(argint(5, &offset) < 0 || offset < 0)
+    return -1;
+  if(p->ofile[fd] == 0)
+    return -1;
+  if(prot & PROT_READ && p->ofile[fd]->readable == 0)
+    return -1;
+  if((flags & MAP_PRIVATE) == 0 && (prot & PROT_WRITE) && p->ofile[fd]->writable == 0)
+    return -1;
+  if(length % PGSIZE != 0)
+    length = PGROUNDUP(length);
+
+  // find a previous unmapped vma if sz fit in,
+  // use that vma if sz is equal to vma's sz or 
+  // split the vma into two part if sz is less than vma's sz: 
+  // first is allocted vma, second is left space vma
+  while(vma != 0){
+    if(vma->unmapped == 1 && length <= vma->sz){
+      vmasplit(vma, length);
+      break;
+    }
+    pre = vma;
+    vma = vma->next;
+  }
+
+  // allocte address start from process's next sz page 
+  // and increase process's memory sz if necessary
+  if(vma == 0){
+    if((vma = vmaalloc()) == 0)
+      panic("sys_mmap");
+    vma->addr = PGROUNDUP(p->sz);
+    p->sz = PGROUNDUP(p->sz) + length;
+    if(pre == 0)
+      p->vma = vma;
+    else
+      pre->next = vma;
+  }
+
+  vma->sz = length;
+  vma->prot = prot;
+  vma->flags = flags;
+  vma->file = filedup(p->ofile[fd]);
+  vma->offset = offset;
+  vma->unmapped = 0;
+
+  // merge continuous vma into one vma
+  // continuous vma addr must not both be unmapped or mapped
+  if(vmatrymerge(pre) == 1)
+    vmatrymerge(pre);
+  else
+    vmatrymerge(vma);
+  return vma->addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, va;
+  int length;
+  struct proc *p = myproc();
+  struct vma *vma = p->vma, *pre = 0;
+
+  if(argaddr(0, &addr) < 0 || addr % PGSIZE != 0)
+    return -1;
+  if(argint(1, &length) < 0 || length <= 0)
+    return -1;
+  if(length % PGSIZE != 0)
+    length = PGROUNDUP(length);
+  
+  // find correspond vma, mark vma unmapped,
+  // write back mapped dirty page to file, free associated physical memory, 
+  // split vma if length is less than vma's sz
+  while(vma != 0){
+    if(vma->addr <= addr && addr < vma->addr + vma->sz){
+      if(vma->unmapped == 1)
+        return -1;
+      
+      if(addr + length > vma->addr + vma->sz)
+        return -1;
+
+      if(vma->addr == addr){
+        vmasplit(vma, length);
+        break;
+      }
+      
+      vmasplit(vma, addr - vma->addr);
+      pre = vma;
+      vma = vma->next;
+      vmasplit(vma, length);
+      break;
+    }
+    pre = vma;
+    vma = vma->next;
+  }
+
+  if(vma == 0)
+    return -1;
+  
+  begin_op();
+  if(vma->flags & MAP_SHARED){
+    ilock(vma->file->ip);
+    for(va = vma->addr; va < vma->addr + vma->sz; va+=PGSIZE){
+      if(walkaddr(p->pagetable, va) != 0){
+        if(writei(vma->file->ip, 1, va, vma->offset + va - vma->addr, PGSIZE) < PGSIZE)
+          panic("sys_munmap: writei");
+      }
+    }
+    iunlock(vma->file->ip);
+  }
+  fileclose(vma->file);
+  end_op();
+
+  for(va = vma->addr; va < vma->addr + vma->sz; va+=PGSIZE){
+    if(walkaddr(p->pagetable, va) != 0){
+      uvmunmap(p->pagetable, va, 1, 1);
+    }
+  }
+
+  vma->prot = 0;
+  vma->flags = 0;
+  vma->file = 0;
+  vma->offset = 0;
+  vma->unmapped = 1;
+
+  // merge continuous vma into one vma
+  // continuous vma addr must not both be unmapped or mapped
+  if(vmatrymerge(pre) == 1)
+    vmatrymerge(pre);
+  else
+    vmatrymerge(vma);
   return 0;
 }

@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -296,6 +300,9 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // copy vma in the child
+  np->vma = vmacopy(p->vma);
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -340,9 +347,30 @@ void
 exit(int status)
 {
   struct proc *p = myproc();
+  struct vma *vma = p->vma;
 
   if(p == initproc)
     panic("init exiting");
+
+  // write back all map shared memory back to file
+  while(vma != 0){
+    if(vma->prot & PROT_WRITE && vma->flags & MAP_SHARED){
+      begin_op();
+      ilock(vma->file->ip);
+      for(uint64 va = vma->addr; va < vma->addr + vma->sz; va+=PGSIZE){
+        if(walkaddr(p->pagetable, va) != 0){
+          if(writei(vma->file->ip, 1, va, vma->offset + va - vma->addr, PGSIZE) != PGSIZE)
+            panic("exit write");
+        }
+      }
+      iunlock(vma->file->ip);
+      fileclose(vma->file);
+      end_op();
+    }
+    vmadealloc(vma);
+    vma = vma->next;
+  }
+  p->vma = 0;
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

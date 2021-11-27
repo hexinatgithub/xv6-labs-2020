@@ -65,3 +65,16 @@
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+
+// virtual memory area
+struct vma {
+  uint64 addr;
+  uint64 sz;
+  int prot;
+  int flags;
+  struct file *file;
+  int offset;
+  int unmapped;
+  struct vma *next;
+  int used;
+};

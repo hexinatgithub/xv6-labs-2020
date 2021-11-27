@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -65,6 +69,61 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 13 || r_scause() == 15){
+    // find a vma mapped region
+    uint64 va = PGROUNDDOWN(r_stval()), pa;
+    int perm, killed = p->killed;
+    struct proc *p = myproc();
+    struct vma *vma = p->vma;
+
+    while(vma != 0){
+      if(vma->addr <= va && va < vma->addr + vma->sz)
+        break;
+      vma = vma->next;
+    }
+
+    // read PGSIZE bytes of the relevant file into that page and 
+    // map it into the user address space if vma exist, else kill 
+    // the process
+    if(vma != 0){
+      if(vma->unmapped == 1){
+        killed = 1;
+        goto end;
+      }
+
+      pa = (uint64)kalloc();
+      if(pa == 0){
+        printf("usertrap(): kalloc, pid=%d\n", p->pid);
+        printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+        killed = 1;
+        goto end;
+      }
+      memset((void*)pa, 0, PGSIZE);
+
+      ilock(vma->file->ip);
+      readi(vma->file->ip, 0, pa, va - vma->addr + vma->offset, PGSIZE);
+      iunlock(vma->file->ip);
+
+      if(vma->prot & PROT_READ)
+        perm = PTE_R | PTE_U;
+      if(vma->prot & PROT_WRITE)
+        perm = PTE_R | PTE_W | PTE_U;
+      if(vma->prot & PROT_EXEC)
+        perm = PTE_R | PTE_W | PTE_X | PTE_U;
+      if(mappages(p->pagetable, va, PGSIZE, pa, perm) < 0){
+        printf("usertrap(): mappages, pid=%d\n", p->pid);
+        printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+        kfree((void*)pa);
+        killed = 1;
+      }
+    } else {
+      printf("usertrap(): page fault, pid=%d\n", p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      killed = 1;
+    }
+end:
+    // end handle page fault
+    p->killed = killed;
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

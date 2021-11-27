@@ -5,6 +5,10 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "proc.h"
+#include "file.h"
 
 /*
  * the kernel's page table.
@@ -14,6 +18,9 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+
+struct vma vmas[NVMA];
+struct spinlock vma_lock;
 
 // Make a direct-map page table for the kernel.
 pagetable_t
@@ -170,9 +177,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -304,9 +311,9 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -428,4 +435,101 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// split address space area into two part, 
+// first part size is sz, second part size is left space
+void
+vmasplit(struct vma *vma, int sz)
+{
+  struct vma *tmp;
+  if(vma->sz == sz)
+    return;
+  if((tmp = vmaalloc()) == 0)
+    panic("vmasplit");
+  tmp->addr = vma->addr + sz;
+  tmp->sz = vma->sz - sz;
+  tmp->prot = vma->prot;
+  tmp->flags = vma->flags;
+  if(vma->file != 0)
+    tmp->file = filedup(vma->file);
+  tmp->offset = vma->offset + sz;
+  tmp->unmapped = vma->unmapped;
+  tmp->next = vma->next;
+  vma->sz = sz;
+  vma->next = tmp;
+}
+
+// try to merge vma and vma's next address area into one, free next vma if can.
+// return 0 if succeed otherwise return 1.
+int
+vmatrymerge(struct vma *vma)
+{
+  struct vma *next;
+  if(vma == 0)
+    return 0;
+  if((next = vma->next)== 0)
+    return 0;
+  if(vma->prot != next->prot)
+    return 0;
+  if(vma->flags != next->flags)
+    return 0;
+  if(vma->file != next->file)
+    return 0;
+  if(vma->file != 0 && vma->offset + vma->sz != next->offset)
+    return 0;
+  if(vma->unmapped != next->unmapped)
+    panic("vmatrymerge");
+
+  if(next->file != 0)
+    fileclose(next->file);
+  vma->sz += next->sz;
+  vma->next = next->next;
+  vmadealloc(next);
+  return 1;
+}
+
+struct vma*
+vmaalloc(void)
+{
+  struct vma *vma = 0;
+  acquire(&vma_lock);
+  for(int i = 0; i < NVMA; i++){
+    if(vmas[i].used == 0){
+      vmas[i].used = 1;
+      vma = &vmas[i];
+      break;
+    }
+  }
+  release(&vma_lock);
+  return vma;
+}
+
+void
+vmadealloc(struct vma *vma)
+{
+  acquire(&vma_lock);
+  memset(vma, 0, sizeof(struct vma));
+  release(&vma_lock);
+}
+
+// deep copy vma
+struct vma*
+vmacopy(struct vma *vma)
+{
+  struct vma *copy;
+  if(vma == 0)
+    return 0;
+  if((copy = vmaalloc()) == 0)
+    panic("vmacopy");
+  copy->addr = vma->addr;
+  copy->sz = vma->sz;
+  copy->prot = vma->prot;
+  copy->flags = vma->flags;
+  if(vma->file != 0)
+    copy->file = filedup(vma->file);
+  copy->offset = vma->offset;
+  copy->unmapped = vma->unmapped;
+  copy->next = vmacopy(vma->next);
+  return copy;
 }
